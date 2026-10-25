@@ -1,4 +1,4 @@
-# CodebaseAI
+<img width="1280" height="683" alt="Screenshot 2026-10-25 at 10 23 02 PM" src="https://github.com/user-attachments/assets/db9433d3-9c2d-4618-b117-2b489b236899" /># CodebaseAI
 
 ### AI-Powered Codebase Assistant
 
@@ -713,6 +713,7 @@ The environment variable defaults shown above reflect the local development conf
 ---
 
 
+
 ### Directory Responsibilities
 
 | Directory | Responsibility |
@@ -792,3 +793,6 @@ CodebaseAI demonstrates how modern full-stack development, vector databases, and
 By connecting GitHub repositories with a RAG pipeline, CodebaseAI helps developers explore source code, understand implementation details, and navigate unfamiliar projects through natural language.
 
 **CodebaseAI: Understand your codebase through conversation.**
+<img width="1280" height="683" alt="Screenshot 2026-10-25 at 10 23 02 PM" src="https://github.com/user-attachments/assets/9b536e94-a823-42df-941e-a901a2eaa041" />
+<img width="1280" height="679" alt="Screenshot 2026-10-25 at 10 22 12 PM" src="https://github.com/user-attachments/assets/26ef457f-d244-432b-9a27-c863463821e8" />
+
