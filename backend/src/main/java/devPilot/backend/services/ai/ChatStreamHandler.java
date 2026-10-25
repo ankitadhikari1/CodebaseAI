@@ -1,7 +1,10 @@
+
 package devPilot.backend.services.ai;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
@@ -16,10 +19,8 @@ import devPilot.backend.entity.MessageRole;
 import devPilot.backend.repository.ChatMessageRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.Disposable;
 
-/**
- * Generation step: call OpenAI via Spring AI and stream tokens to the browser over SSE.
- */
 @Component
 @RequiredArgsConstructor
 @Slf4j
@@ -37,67 +38,186 @@ public class ChatStreamHandler {
             String userPrompt) {
 
         SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
-        StringBuilder fullReply = new StringBuilder();
+
+        StringBuffer fullReply = new StringBuffer();
+        AtomicBoolean terminated = new AtomicBoolean(false);
+        AtomicBoolean clientDisconnected = new AtomicBoolean(false);
+
+        emitter.onCompletion(() -> terminated.set(true));
+
+        emitter.onTimeout(() -> {
+            terminated.set(true);
+            log.warn("Chat SSE timed out for session {}", sessionId);
+        });
+
+        emitter.onError(error -> {
+            terminated.set(true);
+
+            if (isClientDisconnect(error)) {
+                clientDisconnected.set(true);
+                log.debug("Client disconnected from chat stream: {}", sessionId);
+            } else {
+                log.warn("SSE connection error for session {}", sessionId, error);
+            }
+        });
 
         try {
             emitter.send(SseEmitter.event()
                     .name("user_message")
                     .data(savedUserMessage));
 
-            ChatClient.builder(chatModel)
+            Disposable subscription = ChatClient.builder(chatModel)
                     .build()
                     .prompt()
                     .system(systemPrompt)
                     .user(userPrompt)
                     .stream()
                     .content()
-                    .doOnNext(token -> appendToken(emitter, fullReply, token))
-                    .doOnError(err -> {
-                        log.error("Chat stream error", err);
-                        emitter.completeWithError(err);
+                    .doOnNext(token -> {
+                        if (terminated.get() || clientDisconnected.get()) {
+                            return;
+                        }
+
+                        fullReply.append(token);
+
+                        try {
+                            emitter.send(SseEmitter.event()
+                                    .name("token")
+                                    .data(token, MediaType.TEXT_PLAIN));
+                        } catch (IOException | IllegalStateException ex) {
+                            clientDisconnected.set(true);
+                            throw new IllegalStateException(
+                                    "Unable to send token to SSE client", ex);
+                        }
                     })
-                    .doOnComplete(() -> completeStream(
-                            emitter, sessionId, fullReply, citations))
+                    .doOnError(error -> {
+                        if (isClientDisconnect(error)
+                                || clientDisconnected.get()) {
+                            log.debug(
+                                    "Chat stream ended after client disconnect: {}",
+                                    sessionId);
+                            return;
+                        }
+
+                        log.error("Chat generation failed for session {}",
+                                sessionId, error);
+
+                        sendErrorEvent(emitter, error, terminated);
+                    })
+                    .doOnComplete(() -> {
+                        if (terminated.get() || clientDisconnected.get()) {
+                            return;
+                        }
+
+                        completeStream(
+                                emitter,
+                                sessionId,
+                                fullReply.toString(),
+                                citations,
+                                terminated);
+                    })
                     .subscribe();
+
+            emitter.onTimeout(subscription::dispose);
+            emitter.onCompletion(subscription::dispose);
+
         } catch (Exception ex) {
-            emitter.completeWithError(ex);
+            log.error("Unable to start chat stream for session {}",
+                    sessionId, ex);
+
+            sendErrorEvent(emitter, ex, terminated);
         }
 
         return emitter;
     }
 
-    private void appendToken(SseEmitter emitter, StringBuilder fullReply, String token) {
-        fullReply.append(token);
-        try {
-            emitter.send(SseEmitter.event()
-                    .name("token")
-                    .data(token, MediaType.APPLICATION_JSON));
-        } catch (Exception ex) {
-            throw new IllegalStateException(ex);
-        }
-    }
-
     private void completeStream(
             SseEmitter emitter,
             UUID sessionId,
-            StringBuilder fullReply,
-            List<CitationDto> citations) {
+            String reply,
+            List<CitationDto> citations,
+            AtomicBoolean terminated) {
+
+        if (!terminated.compareAndSet(false, true)) {
+            return;
+        }
+
         try {
-            ChatMessage assistant = chatMessageRepository.save(ChatMessage.builder()
-                    .sessionId(sessionId)
-                    .role(MessageRole.ASSISTANT)
-                    .content(fullReply.toString())
-                    .citations(citationMapper.toJson(citations))
-                    .build());
+            ChatMessage assistant = chatMessageRepository.save(
+                    ChatMessage.builder()
+                            .sessionId(sessionId)
+                            .role(MessageRole.ASSISTANT)
+                            .content(reply)
+                            .citations(citationMapper.toJson(citations))
+                            .build());
 
             emitter.send(SseEmitter.event()
                     .name("assistant_message")
                     .data(toMessageResponse(assistant)));
-            emitter.send(SseEmitter.event().name("done").data("[DONE]"));
+
+            emitter.send(SseEmitter.event()
+                    .name("done")
+                    .data("[DONE]"));
+
             emitter.complete();
+
         } catch (Exception ex) {
+            log.error("Failed to save or complete assistant response for session {}",
+                    sessionId, ex);
+
             emitter.completeWithError(ex);
         }
+    }
+
+    private void sendErrorEvent(
+            SseEmitter emitter,
+            Throwable error,
+            AtomicBoolean terminated) {
+
+        if (!terminated.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            emitter.send(SseEmitter.event()
+                    .name("error")
+                    .data("The AI response could not be generated. Please try again.",
+                            MediaType.TEXT_PLAIN));
+
+            emitter.complete();
+
+        } catch (Exception sendError) {
+            log.debug("Could not send SSE error event; connection may be closed",
+                    sendError);
+            emitter.completeWithError(error);
+        }
+    }
+
+    private boolean isClientDisconnect(Throwable error) {
+        Throwable current = error;
+
+        while (current != null) {
+            if (current instanceof IOException) {
+                return true;
+            }
+
+            String message = current.getMessage();
+
+            if (message != null) {
+                String lower = message.toLowerCase();
+
+                if (lower.contains("connection reset")
+                        || lower.contains("broken pipe")
+                        || lower.contains("connection aborted")
+                        || lower.contains("client abort")) {
+                    return true;
+                }
+            }
+
+            current = current.getCause();
+        }
+
+        return false;
     }
 
     private ChatMessageResponse toMessageResponse(ChatMessage message) {
